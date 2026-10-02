@@ -1,11 +1,15 @@
 import request from "supertest";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { app } from "../src/app.js";
 import { clearTasks } from "../src/store/taskStore.js";
 
 beforeEach(() => {
   clearTasks();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("GET /health", () => {
@@ -21,7 +25,11 @@ describe("task CRUD contracts", () => {
   it("supports the full CRUD lifecycle with the required statuses", async () => {
     const emptyList = await request(app).get("/tasks");
     expect(emptyList.status).toBe(200);
-    expect(emptyList.body).toEqual([]);
+    expect(emptyList.body).toEqual({
+      data: [],
+      nextCursor: null,
+      hasMore: false,
+    });
 
     const created = await request(app).post("/tasks").send({
       title: "Write tests",
@@ -62,7 +70,7 @@ describe("task CRUD contracts", () => {
 
     const populatedList = await request(app).get("/tasks");
     expect(populatedList.status).toBe(200);
-    expect(populatedList.body).toHaveLength(1);
+    expect(populatedList.body.data).toHaveLength(1);
 
     const deleted = await request(app).delete(`/tasks/${id}`);
     expect(deleted.status).toBe(204);
@@ -90,6 +98,107 @@ describe("task CRUD contracts", () => {
 
     const deleted = await request(app).delete(`/tasks/${missingId}`);
     expect(deleted.status).toBe(404);
+  });
+
+  it("returns tasks newest first across cursor-based pages", async () => {
+    const timestamps = Array.from(
+      { length: 12 },
+      (_, index) => new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    );
+    vi.spyOn(Date.prototype, "toISOString").mockImplementation(
+      () => timestamps.shift() ?? "2026-01-01T00:00:00.000Z",
+    );
+
+    for (let index = 0; index < 12; index += 1) {
+      const created = await request(app).post("/tasks").send({
+        title: `Task ${index}`,
+        description: "",
+        status: "todo",
+      });
+      expect(created.status).toBe(201);
+    }
+
+    const firstPage = await request(app).get("/tasks?limit=5");
+    expect(firstPage.status).toBe(200);
+    expect(firstPage.body.data).toHaveLength(5);
+    expect(firstPage.body.data.map((task: { title: string }) => task.title)).toEqual([
+      "Task 11",
+      "Task 10",
+      "Task 9",
+      "Task 8",
+      "Task 7",
+    ]);
+    expect(firstPage.body.hasMore).toBe(true);
+    expect(Buffer.from(firstPage.body.nextCursor, "base64").toString()).toBe(
+      firstPage.body.data[4].id,
+    );
+
+    const secondPage = await request(app)
+      .get("/tasks")
+      .query({ limit: 5, cursor: firstPage.body.nextCursor });
+    expect(secondPage.status).toBe(200);
+    expect(secondPage.body.data.map((task: { title: string }) => task.title)).toEqual([
+      "Task 6",
+      "Task 5",
+      "Task 4",
+      "Task 3",
+      "Task 2",
+    ]);
+    expect(secondPage.body.hasMore).toBe(true);
+
+    const lastPage = await request(app)
+      .get("/tasks")
+      .query({ limit: 5, cursor: secondPage.body.nextCursor });
+    expect(lastPage.status).toBe(200);
+    expect(lastPage.body.data.map((task: { title: string }) => task.title)).toEqual([
+      "Task 1",
+      "Task 0",
+    ]);
+    expect(lastPage.body).toMatchObject({ nextCursor: null, hasMore: false });
+  });
+
+  it("uses a default page size of 20", async () => {
+    for (let index = 0; index < 21; index += 1) {
+      await request(app).post("/tasks").send({
+        title: `Task ${index}`,
+        description: "",
+        status: "todo",
+      });
+    }
+
+    const response = await request(app).get("/tasks");
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toHaveLength(20);
+    expect(response.body.hasMore).toBe(true);
+    expect(response.body.nextCursor).toEqual(expect.any(String));
+  });
+
+  it.each(["0", "101", "1.5", "invalid"])(
+    "rejects invalid limit %s",
+    async (limit) => {
+      const response = await request(app).get("/tasks").query({ limit });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({
+        error: {
+          code: "INVALID_LIMIT",
+          message: "Query parameter 'limit' must be an integer between 1 and 100.",
+        },
+      });
+    },
+  );
+
+  it("rejects malformed and unknown cursors", async () => {
+    const malformed = await request(app).get("/tasks?cursor=not-base64!");
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.error.code).toBe("INVALID_CURSOR");
+
+    const unknown = await request(app)
+      .get("/tasks")
+      .query({ cursor: Buffer.from("missing-task").toString("base64") });
+    expect(unknown.status).toBe(400);
+    expect(unknown.body.error.code).toBe("INVALID_CURSOR");
   });
 });
 
